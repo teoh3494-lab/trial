@@ -29,6 +29,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             comments INTEGER,
             tags TEXT,
             thumbnail_url TEXT,
+            watch_url TEXT,
             region TEXT,
             keyword TEXT,
             category TEXT,
@@ -44,7 +45,9 @@ def init_db(conn: sqlite3.Connection) -> None:
             title TEXT,
             channel TEXT,
             added_ts TEXT,
-            category TEXT
+            category TEXT,
+            thumbnail_url TEXT,
+            watch_url TEXT
         )
         """
     )
@@ -69,6 +72,9 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
     )
     _ensure_column(conn, "saved_videos", "thumbnail_url", "TEXT")
+    _ensure_column(conn, "saved_videos", "watch_url", "TEXT")
+    _ensure_column(conn, "tracked_videos", "thumbnail_url", "TEXT")
+    _ensure_column(conn, "tracked_videos", "watch_url", "TEXT")
     conn.commit()
 
 
@@ -91,6 +97,7 @@ def upsert_saved_video(
     comments: int,
     tags: str,
     thumbnail_url: str,
+    watch_url: str,
     region: str,
     keyword: str,
     category: str,
@@ -101,8 +108,8 @@ def upsert_saved_video(
         """
         INSERT INTO saved_videos (
             video_id, title, channel, publishedAt, duration_sec, views, likes,
-            comments, tags, thumbnail_url, region, keyword, category, saved_ts, notes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            comments, tags, thumbnail_url, watch_url, region, keyword, category, saved_ts, notes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(video_id) DO UPDATE SET
             title=excluded.title,
             channel=excluded.channel,
@@ -113,6 +120,7 @@ def upsert_saved_video(
             comments=excluded.comments,
             tags=excluded.tags,
             thumbnail_url=excluded.thumbnail_url,
+            watch_url=excluded.watch_url,
             region=excluded.region,
             keyword=excluded.keyword,
             category=excluded.category,
@@ -130,6 +138,7 @@ def upsert_saved_video(
             comments,
             tags,
             thumbnail_url,
+            watch_url,
             region,
             keyword,
             category,
@@ -147,17 +156,21 @@ def add_tracked_video(
     channel: str,
     added_ts: str,
     category: str,
+    thumbnail_url: str,
+    watch_url: str,
 ) -> None:
     conn.execute(
         """
-        INSERT INTO tracked_videos (video_id, title, channel, added_ts, category)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO tracked_videos (video_id, title, channel, added_ts, category, thumbnail_url, watch_url)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(video_id) DO UPDATE SET
             title=excluded.title,
             channel=excluded.channel,
-            category=excluded.category
+            category=excluded.category,
+            thumbnail_url=excluded.thumbnail_url,
+            watch_url=excluded.watch_url
         """,
-        (video_id, title, channel, added_ts, category),
+        (video_id, title, channel, added_ts, category, thumbnail_url, watch_url),
     )
     conn.commit()
 

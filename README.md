@@ -4,6 +4,7 @@ Local YouTube trends research tool inspired by “Tube Trends Buddy”.
 
 ## Features
 - Super Search Engine with YouTube Data API v3 (search + videos.list).
+- Grid video cards with preview panel + analytic modal (performance, keywords, transcript).
 - Save results to local SQLite bank, with category and notes.
 - Track videos + snapshots, VPH (Views per Hour) detection.
 - Heatmap for best upload time by channel.
@@ -38,6 +39,9 @@ streamlit run app.py
 ```bash
 pip install -r requirements-extra.txt
 ```
+> Requires FFmpeg available in PATH for best results.
+
+To enable OAuth caption downloads, add `oauth/client_secret.json` and follow the prompt on first use.
 
 ## Snapshot Runner (for scheduling)
 The Streamlit app cannot reliably run background jobs. Use `snapshot_runner.py` in Task Scheduler.
