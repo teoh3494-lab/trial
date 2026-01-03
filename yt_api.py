@@ -18,6 +18,7 @@ class VideoDetail:
     likes: int
     comments: int
     tags: list[str]
+    thumbnail_url: str
 
 
 def build_youtube_client(api_key: str):
@@ -102,6 +103,12 @@ def fetch_video_details(yt, video_ids: Iterable[str]) -> list[VideoDetail]:
             snippet = item.get("snippet", {})
             content = item.get("contentDetails", {})
             tags = snippet.get("tags") or []
+            thumbnails = snippet.get("thumbnails", {})
+            thumbnail_url = ""
+            for key in ("high", "medium", "default"):
+                if thumbnails.get(key, {}).get("url"):
+                    thumbnail_url = thumbnails[key]["url"]
+                    break
             details.append(
                 VideoDetail(
                     video_id=item.get("id", ""),
@@ -115,6 +122,7 @@ def fetch_video_details(yt, video_ids: Iterable[str]) -> list[VideoDetail]:
                     if stats.get("commentCount")
                     else 0,
                     tags=tags,
+                    thumbnail_url=thumbnail_url,
                 )
             )
     return details

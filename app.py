@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import sqlite3
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
@@ -11,6 +13,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.oauth2.credentials import Credentials
 
 import db
 import scoring
@@ -95,6 +101,22 @@ def compute_vph(snapshots: pd.DataFrame, hours: int) -> float:
     if delta_hours <= 0:
         return 0.0
     return max(0.0, delta_views / delta_hours)
+
+
+def get_vph_for_video(video_id: str, hours: int = 1) -> float:
+    snapshots = pd.DataFrame(db.iter_rows(db.fetch_snapshots(conn, video_id)))
+    if snapshots.empty:
+        return 0.0
+    snapshots["ts"] = pd.to_datetime(snapshots["ts"], utc=True)
+    return compute_vph(snapshots, hours)
+
+
+def _format_srt_time(seconds: float) -> str:
+    millis = int((seconds - int(seconds)) * 1000)
+    total_seconds = int(seconds)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
 def sidebar_config() -> dict:
@@ -198,8 +220,10 @@ with search_tab:
         for detail in details:
             if shorts_only and detail.duration_sec > 60:
                 continue
+            vph_1h = get_vph_for_video(detail.video_id, 1)
             rows.append(
                 {
+                    "thumbnail": detail.thumbnail_url,
                     "video_id": detail.video_id,
                     "title": detail.title,
                     "channel": detail.channel,
@@ -208,17 +232,35 @@ with search_tab:
                     "views": detail.views,
                     "likes": detail.likes,
                     "comments": detail.comments,
+                    "VPH_1h": round(vph_1h, 2),
                     "tags": ", ".join(detail.tags),
-                    "video_url": format_video_url(detail.video_id),
+                    "watch_url": format_video_url(detail.video_id),
                 }
             )
         if rows:
             results_df = pd.DataFrame(rows)
+            results_df = results_df[
+                [
+                    "thumbnail",
+                    "title",
+                    "channel",
+                    "publishedAt",
+                    "duration_sec",
+                    "views",
+                    "VPH_1h",
+                    "watch_url",
+                    "video_id",
+                    "likes",
+                    "comments",
+                    "tags",
+                ]
+            ]
             st.dataframe(
                 results_df,
                 use_container_width=True,
                 column_config={
-                    "video_url": st.column_config.LinkColumn("video_url"),
+                    "thumbnail": st.column_config.ImageColumn("thumbnail"),
+                    "watch_url": st.column_config.LinkColumn("Watch"),
                 },
             )
             st.session_state["last_search_results"] = [
@@ -234,6 +276,18 @@ with search_tab:
             selected_ids = st.multiselect(
                 "Select videos", options=results_df["video_id"].tolist()
             )
+            preview_id = st.selectbox(
+                "Preview video", options=results_df["video_id"].tolist()
+            )
+            if preview_id:
+                selected_row = results_df.loc[results_df["video_id"] == preview_id].iloc[0]
+                st.video(selected_row["watch_url"])
+                metrics_cols = st.columns(5)
+                metrics_cols[0].metric("Views", int(selected_row["views"]))
+                metrics_cols[1].metric("Likes", int(selected_row["likes"]))
+                metrics_cols[2].metric("Comments", int(selected_row["comments"]))
+                metrics_cols[3].metric("Duration (s)", int(selected_row["duration_sec"]))
+                metrics_cols[4].metric("Published", selected_row["publishedAt"])
             col_a, col_b = st.columns(2)
             with col_a:
                 if st.button("Save to Bank"):
@@ -251,6 +305,7 @@ with search_tab:
                                 likes=int(row["likes"]),
                                 comments=int(row["comments"]),
                                 tags=row["tags"],
+                                thumbnail_url=row["thumbnail"],
                                 region=region_code,
                                 keyword=query,
                                 category=category_input,
@@ -627,6 +682,7 @@ with bank_tab:
             bank_df,
             use_container_width=True,
             column_config={
+                "thumbnail_url": st.column_config.ImageColumn("thumbnail"),
                 "video_url": st.column_config.LinkColumn("video_url"),
             },
         )
@@ -689,7 +745,168 @@ with tracked_tab:
 
 with captions_tab:
     st.subheader("Captions (OAuth required)")
-    st.info(
-        "Captions API requires OAuth and permissions for the target videos. "
-        "If you have client_secrets.json and token, place them locally and use your own script."
+    st.markdown(
+        "Captions API only lists tracks; to download text you must use `captions.download` with "
+        "OAuth and proper permissions."
     )
+    cache_dir = Path("cache_srt")
+    cache_dir.mkdir(exist_ok=True)
+    oauth_dir = Path("oauth")
+    client_secret_path = oauth_dir / "client_secret.json"
+    token_path = oauth_dir / "token.json"
+
+    st.markdown("### Mode A: YouTube Captions API (OAuth)")
+    api_col1, api_col2 = st.columns([2, 1])
+    with api_col1:
+        api_video_id = st.text_input("Video ID for captions.list")
+    with api_col2:
+        api_format = st.selectbox("Download format", ["srt", "vtt"])
+
+    oauth_ready = client_secret_path.exists()
+    if not oauth_ready:
+        st.warning(
+            "OAuth not configured. Add ./oauth/client_secret.json to enable captions API mode."
+        )
+
+    def get_oauth_credentials() -> Credentials | None:
+        if not client_secret_path.exists():
+            return None
+        creds = None
+        if token_path.exists():
+            creds = Credentials.from_authorized_user_file(
+                str(token_path),
+                scopes=["https://www.googleapis.com/auth/youtube.force-ssl"],
+            )
+        if not creds or not creds.valid:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                str(client_secret_path),
+                scopes=["https://www.googleapis.com/auth/youtube.force-ssl"],
+            )
+            creds = flow.run_local_server(port=0)
+            oauth_dir.mkdir(exist_ok=True)
+            token_path.write_text(creds.to_json())
+        return creds
+
+    if st.button(
+        "List Caption Tracks",
+        disabled=not (oauth_ready and api_video_id),
+    ):
+        with st.spinner("Listing caption tracks..."):
+            try:
+                creds = get_oauth_credentials()
+                if not creds:
+                    st.error("OAuth credentials not available.")
+                else:
+                    yt_oauth = build(
+                        "youtube", "v3", credentials=creds, cache_discovery=False
+                    )
+                    response = (
+                        yt_oauth.captions()
+                        .list(part="snippet", videoId=api_video_id)
+                        .execute()
+                    )
+                    items = response.get("items", [])
+                    if not items:
+                        st.info("No caption tracks found.")
+                    else:
+                        tracks = [
+                            {
+                                "id": item["id"],
+                                "language": item["snippet"].get("language"),
+                                "name": item["snippet"].get("name", ""),
+                                "trackKind": item["snippet"].get("trackKind", ""),
+                            }
+                            for item in items
+                        ]
+                        st.session_state["caption_tracks"] = tracks
+                        st.dataframe(pd.DataFrame(tracks), use_container_width=True)
+            except HttpError as exc:
+                if exc.resp.status == 403:
+                    st.error(
+                        "Not properly authorized / insufficient permissions for captions."
+                    )
+                else:
+                    st.error(f"YouTube API error: {exc}")
+
+    tracks = st.session_state.get("caption_tracks", [])
+    if tracks:
+        track_id = st.selectbox(
+            "Select track to download", [track["id"] for track in tracks]
+        )
+        if st.button(
+            "Download Caption Track",
+            disabled=not oauth_ready,
+        ):
+            with st.spinner("Downloading captions..."):
+                try:
+                    creds = get_oauth_credentials()
+                    if not creds:
+                        st.error("OAuth credentials not available.")
+                    else:
+                        yt_oauth = build(
+                            "youtube", "v3", credentials=creds, cache_discovery=False
+                        )
+                        request = yt_oauth.captions().download(
+                            id=track_id, tfmt=api_format
+                        )
+                        buffer = io.BytesIO()
+                        downloader = MediaIoBaseDownload(buffer, request)
+                        done = False
+                        while not done:
+                            _, done = downloader.next_chunk()
+                        buffer.seek(0)
+                        filename = cache_dir / f"{track_id}.{api_format}"
+                        filename.write_bytes(buffer.read())
+                        st.success(f"Saved to {filename}")
+                except HttpError as exc:
+                    if exc.resp.status == 403:
+                        st.error(
+                            "Not properly authorized / insufficient permissions for captions."
+                        )
+                    else:
+                        st.error(f"YouTube API error: {exc}")
+
+    st.markdown("---")
+    st.markdown("### Mode B: Local Transcribe (Upload File)")
+    uploaded = st.file_uploader(
+        "Upload audio/video (mp3/wav/mp4)", type=["mp3", "wav", "mp4"]
+    )
+    try:
+        from faster_whisper import WhisperModel  # type: ignore
+    except ImportError:
+        WhisperModel = None
+
+    if WhisperModel is None:
+        st.info(
+            "Local transcription requires extra dependencies. Install with:\n"
+            "`pip install -r requirements-extra.txt`"
+        )
+    if uploaded and WhisperModel is not None:
+        cache_uploads = Path("cache_uploads")
+        cache_uploads.mkdir(exist_ok=True)
+        upload_path = cache_uploads / uploaded.name
+        upload_path.write_bytes(uploaded.getbuffer())
+        file_stat = upload_path.stat()
+        cache_key = f"{uploaded.name}_{file_stat.st_size}_{file_stat.st_mtime}"
+        srt_path = cache_dir / f"{cache_key}.srt"
+
+        if st.button("Transcribe to SRT"):
+            if srt_path.exists():
+                st.success(f"Using cached transcript: {srt_path}")
+            else:
+                with st.spinner("Transcribing..."):
+                    model = WhisperModel("base", device="cpu", compute_type="int8")
+                    segments, _ = model.transcribe(str(upload_path))
+                    srt_lines = []
+                    for idx, segment in enumerate(segments, start=1):
+                        start = _format_srt_time(segment.start)
+                        end = _format_srt_time(segment.end)
+                        srt_lines.append(f"{idx}\\n{start} --> {end}\\n{segment.text.strip()}\\n")
+                    srt_path.write_text("\\n".join(srt_lines), encoding="utf-8")
+                    st.success(f"Saved SRT: {srt_path}")
+            st.download_button(
+                "Download SRT",
+                data=srt_path.read_bytes(),
+                file_name=srt_path.name,
+                mime="text/plain",
+            )

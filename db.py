@@ -6,6 +6,15 @@ from typing import Iterable, Optional
 DB_NAME = "tube_trends.db"
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, col_type: str) -> None:
+    existing = {
+        row["name"]
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -19,6 +28,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             likes INTEGER,
             comments INTEGER,
             tags TEXT,
+            thumbnail_url TEXT,
             region TEXT,
             keyword TEXT,
             category TEXT,
@@ -58,6 +68,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    _ensure_column(conn, "saved_videos", "thumbnail_url", "TEXT")
     conn.commit()
 
 
@@ -79,6 +90,7 @@ def upsert_saved_video(
     likes: int,
     comments: int,
     tags: str,
+    thumbnail_url: str,
     region: str,
     keyword: str,
     category: str,
@@ -89,8 +101,8 @@ def upsert_saved_video(
         """
         INSERT INTO saved_videos (
             video_id, title, channel, publishedAt, duration_sec, views, likes,
-            comments, tags, region, keyword, category, saved_ts, notes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            comments, tags, thumbnail_url, region, keyword, category, saved_ts, notes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(video_id) DO UPDATE SET
             title=excluded.title,
             channel=excluded.channel,
@@ -100,6 +112,7 @@ def upsert_saved_video(
             likes=excluded.likes,
             comments=excluded.comments,
             tags=excluded.tags,
+            thumbnail_url=excluded.thumbnail_url,
             region=excluded.region,
             keyword=excluded.keyword,
             category=excluded.category,
@@ -116,6 +129,7 @@ def upsert_saved_video(
             likes,
             comments,
             tags,
+            thumbnail_url,
             region,
             keyword,
             category,

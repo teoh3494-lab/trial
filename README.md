@@ -34,6 +34,11 @@ Edit `.env` and add your API keys.
 streamlit run app.py
 ```
 
+## Optional: Local Transcription (Captions)
+```bash
+pip install -r requirements-extra.txt
+```
+
 ## Snapshot Runner (for scheduling)
 The Streamlit app cannot reliably run background jobs. Use `snapshot_runner.py` in Task Scheduler.
 
