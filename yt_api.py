@@ -12,6 +12,7 @@ class VideoDetail:
     video_id: str
     title: str
     channel: str
+    channel_id: str
     published_at: str
     duration_sec: int
     views: int
@@ -19,6 +20,7 @@ class VideoDetail:
     comments: int
     tags: list[str]
     thumbnail_url: str
+    description: str
 
 
 def build_youtube_client(api_key: str):
@@ -114,6 +116,7 @@ def fetch_video_details(yt, video_ids: Iterable[str]) -> list[VideoDetail]:
                     video_id=item.get("id", ""),
                     title=snippet.get("title", ""),
                     channel=snippet.get("channelTitle", ""),
+                    channel_id=snippet.get("channelId", ""),
                     published_at=snippet.get("publishedAt", ""),
                     duration_sec=parse_iso8601_duration(content.get("duration", "PT0S")),
                     views=int(stats.get("viewCount", 0)),
@@ -123,6 +126,7 @@ def fetch_video_details(yt, video_ids: Iterable[str]) -> list[VideoDetail]:
                     else 0,
                     tags=tags,
                     thumbnail_url=thumbnail_url,
+                    description=snippet.get("description", ""),
                 )
             )
     return details

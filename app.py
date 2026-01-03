@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -119,6 +121,393 @@ def _format_srt_time(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
+def format_count(value: int) -> str:
+    if value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.1f}B"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}K"
+    return str(value)
+
+
+def format_duration(seconds: int) -> str:
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:d}:{secs:02d}"
+
+
+def format_age(published_at: str) -> str:
+    if not published_at:
+        return "-"
+    try:
+        published_dt = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+    except ValueError:
+        return published_at
+    delta = datetime.now(timezone.utc) - published_dt
+    if delta.days >= 365:
+        years = delta.days // 365
+        return f"{years}y ago"
+    if delta.days >= 30:
+        months = delta.days // 30
+        return f"{months}mo ago"
+    if delta.days >= 1:
+        return f"{delta.days}d ago"
+    hours = int(delta.total_seconds() // 3600)
+    if hours >= 1:
+        return f"{hours}h ago"
+    minutes = int(delta.total_seconds() // 60)
+    return f"{max(1, minutes)}m ago"
+
+
+def extract_keywords(*fields: str, limit: int = 12) -> list[str]:
+    text = " ".join(fields)
+    cleaned = "".join(char if char.isalnum() or char.isspace() else " " for char in text)
+    words = [word.lower() for word in cleaned.split() if len(word) >= 4]
+    stopwords = {
+        "yang",
+        "dari",
+        "with",
+        "this",
+        "that",
+        "untuk",
+        "dalam",
+        "akan",
+        "video",
+        "channel",
+        "anda",
+        "kamu",
+        "dengan",
+        "yang",
+        "pada",
+        "dari",
+        "the",
+        "and",
+        "for",
+        "atau",
+        "how",
+        "what",
+        "your",
+    }
+    keywords = [word for word in words if word not in stopwords]
+    counts: dict[str, int] = {}
+    for word in keywords:
+        counts[word] = counts.get(word, 0) + 1
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return [word for word, _ in ranked[:limit]]
+
+
+def build_cache_key(name: str, size: int, mtime: float) -> str:
+    raw = f"{name}:{size}:{mtime}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+OAUTH_SCOPES = ["https://www.googleapis.com/auth/youtube.force-ssl"]
+
+
+def get_oauth_credentials(oauth_dir: Path) -> Credentials | None:
+    client_secret_path = oauth_dir / "client_secret.json"
+    token_path = oauth_dir / "token.json"
+    if not client_secret_path.exists():
+        return None
+    creds = None
+    if token_path.exists():
+        creds = Credentials.from_authorized_user_file(
+            str(token_path),
+            scopes=OAUTH_SCOPES,
+        )
+    if not creds or not creds.valid:
+        flow = InstalledAppFlow.from_client_secrets_file(
+            str(client_secret_path),
+            scopes=OAUTH_SCOPES,
+        )
+        creds = flow.run_local_server(port=0)
+        oauth_dir.mkdir(exist_ok=True)
+        token_path.write_text(creds.to_json())
+    return creds
+
+
+def fetch_latest_channel_uploads(yt, channel_id: str, max_results: int = 5) -> list[dict]:
+    request = (
+        yt.search()
+        .list(
+            part="snippet",
+            type="video",
+            channelId=channel_id,
+            order="date",
+            maxResults=max_results,
+        )
+    )
+    response = request.execute()
+    items = response.get("items", [])
+    uploads = []
+    for item in items:
+        snippet = item.get("snippet", {})
+        video_id = item.get("id", {}).get("videoId")
+        if not video_id:
+            continue
+        uploads.append(
+            {
+                "video_id": video_id,
+                "title": snippet.get("title", ""),
+                "published_at": snippet.get("publishedAt", ""),
+            }
+        )
+    return uploads
+
+
+@st.dialog("Analitik Video")
+def show_video_dialog(
+    video: dict,
+    config: dict,
+    conn: sqlite3.Connection,
+    default_tab: str | None = None,
+) -> None:
+    st.markdown(
+        f"**{video['title']}**  \n{video['channel']}"
+    )
+    thumb_col, info_col = st.columns([1, 2])
+    with thumb_col:
+        st.image(video["thumbnail"], use_container_width=True)
+    with info_col:
+        vph_1h = get_vph_for_video(video["video_id"], 1)
+        views = int(video["views"])
+        likes = int(video["likes"])
+        hours_since_publish = 0.0
+        if video.get("publishedAt"):
+            published_dt = datetime.fromisoformat(video["publishedAt"].replace("Z", "+00:00"))
+            hours_since_publish = max(
+                0.0, (datetime.now(timezone.utc) - published_dt).total_seconds() / 3600
+            )
+        likes_per_view = likes / views if views else 0.0
+        breakdown = scoring.compute_viral_score(
+            vph_1h=vph_1h,
+            views=views,
+            hours_since_publish=hours_since_publish,
+            likes_per_view=likes_per_view,
+        )
+        metric_cols = st.columns(6)
+        metric_cols[0].metric("Views", format_count(views))
+        metric_cols[1].metric("VPH/hr", f"{vph_1h:.2f}")
+        metric_cols[2].metric("Duration", format_duration(int(video["duration_sec"])))
+        metric_cols[3].metric("Published", format_age(video["publishedAt"]))
+        metric_cols[4].metric("Likes", format_count(likes))
+        metric_cols[5].metric("Viral Score", f"{breakdown.total_score:.1f}")
+
+    tabs = st.tabs(["Performance", "Kata Kunci", "Video Channel", "Transkrip"])
+    if default_tab:
+        st.caption(f"Tab default: {default_tab}.")
+
+    with tabs[0]:
+        snapshots = pd.DataFrame(db.iter_rows(db.fetch_snapshots(conn, video["video_id"])))
+        if not snapshots.empty:
+            snapshots["ts"] = pd.to_datetime(snapshots["ts"], utc=True)
+            snapshots = snapshots.sort_values("ts")
+            fig = go.Figure()
+            fig.add_trace(
+                go.Scatter(
+                    x=snapshots["ts"],
+                    y=snapshots["view_count"],
+                    mode="lines+markers",
+                    name="Views",
+                )
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No snapshots yet for this video.")
+
+    with tabs[1]:
+        keywords = extract_keywords(
+            video.get("title", ""),
+            video.get("description", ""),
+            video.get("tags", ""),
+        )
+        if keywords:
+            st.write("Saran kata kunci:")
+            st.write(", ".join(keywords))
+        else:
+            st.info("No keyword suggestions available.")
+        if config.get("gemini_key"):
+            st.caption("Gemini tersedia untuk ide tambahan jika diperlukan.")
+
+    with tabs[2]:
+        channel_link = (
+            f"https://www.youtube.com/channel/{video['channel_id']}"
+            if video.get("channel_id")
+            else f"https://www.youtube.com/results?search_query={video['channel']}"
+        )
+        st.markdown(f"**Channel:** {video['channel']}")
+        st.markdown(f"[Buka Channel]({channel_link})")
+        if config.get("yt_key") and video.get("channel_id"):
+            with st.spinner("Memuat upload terbaru channel..."):
+                yt = get_youtube_client(config["yt_key"])
+                try:
+                    uploads = fetch_latest_channel_uploads(yt, video["channel_id"], max_results=5)
+                except HttpError as exc:
+                    st.error(f"YouTube API error: {exc}")
+                    uploads = []
+            if uploads:
+                st.markdown("**Upload terbaru:**")
+                for item in uploads:
+                    link = format_video_url(item["video_id"])
+                    st.markdown(f"- [{item['title']}]({link})")
+            else:
+                st.info("Tidak ada data upload terbaru.")
+        else:
+            st.info("Tambahkan API key untuk melihat upload terbaru channel.")
+
+    with tabs[3]:
+        st.markdown(
+            "Mode A (OAuth): `captions.list` hanya daftar track, teks asli harus melalui "
+            "`captions.download`."
+        )
+        oauth_dir = Path("oauth")
+        cache_dir = Path("cache_srt")
+        cache_dir.mkdir(exist_ok=True)
+        oauth_ready = (oauth_dir / "client_secret.json").exists()
+        if not oauth_ready:
+            st.warning(
+                "OAuth belum dikonfigurasi. Tambahkan `oauth/client_secret.json` untuk mencoba "
+                "download caption dari YouTube."
+            )
+
+        track_key = f"dialog_tracks_{video['video_id']}"
+        if st.button("Cek Caption Tracks (OAuth)", disabled=not oauth_ready):
+            with st.spinner("Mengambil daftar caption..."):
+                try:
+                    creds = get_oauth_credentials(oauth_dir)
+                    if not creds:
+                        st.error("OAuth credentials tidak tersedia.")
+                    else:
+                        yt_oauth = build(
+                            "youtube", "v3", credentials=creds, cache_discovery=False
+                        )
+                        response = (
+                            yt_oauth.captions()
+                            .list(part="snippet", videoId=video["video_id"])
+                            .execute()
+                        )
+                        items = response.get("items", [])
+                        tracks = [
+                            {
+                                "id": item["id"],
+                                "language": item["snippet"].get("language"),
+                                "name": item["snippet"].get("name", ""),
+                                "trackKind": item["snippet"].get("trackKind", ""),
+                            }
+                            for item in items
+                        ]
+                        st.session_state[track_key] = tracks
+                except HttpError as exc:
+                    if exc.resp.status == 403:
+                        st.error(
+                            "Izin tidak cukup untuk captions API. Gunakan mode transkrip lokal."
+                        )
+                    else:
+                        st.error(f"YouTube API error: {exc}")
+
+        tracks = st.session_state.get(track_key, [])
+        srt_text_key = f"srt_text_{video['video_id']}"
+        if tracks:
+            st.dataframe(pd.DataFrame(tracks), use_container_width=True)
+            track_id = st.selectbox(
+                "Pilih track untuk download",
+                [track["id"] for track in tracks],
+                key=f"track_select_{video['video_id']}",
+            )
+            if st.button("Download Caption (SRT)", key=f"download_{video['video_id']}"):
+                with st.spinner("Downloading captions..."):
+                    try:
+                        creds = get_oauth_credentials(oauth_dir)
+                        if not creds:
+                            st.error("OAuth credentials tidak tersedia.")
+                        else:
+                            yt_oauth = build(
+                                "youtube", "v3", credentials=creds, cache_discovery=False
+                            )
+                            request = yt_oauth.captions().download(
+                                id=track_id, tfmt="srt"
+                            )
+                            buffer = io.BytesIO()
+                            downloader = MediaIoBaseDownload(buffer, request)
+                            done = False
+                            while not done:
+                                _, done = downloader.next_chunk()
+                            buffer.seek(0)
+                            srt_text = buffer.read().decode("utf-8", errors="ignore")
+                            st.session_state[srt_text_key] = srt_text
+                    except HttpError as exc:
+                        if exc.resp.status == 403:
+                            st.error(
+                                "Izin tidak cukup untuk captions API. Gunakan mode transkrip lokal."
+                            )
+                        else:
+                            st.error(f"YouTube API error: {exc}")
+
+        st.markdown("---")
+        st.markdown("Mode B: Local Transcribe (Upload File)")
+        uploaded = st.file_uploader(
+            "Upload audio/video (mp3/wav/mp4)",
+            type=["mp3", "wav", "mp4"],
+            key=f"upload_{video['video_id']}",
+        )
+        whisper_spec = importlib.util.find_spec("faster_whisper")
+        if whisper_spec is None:
+            st.info(
+                "Local transcription membutuhkan dependency tambahan. Install dengan:\n"
+                "`pip install -r requirements-extra.txt`"
+            )
+        if uploaded and whisper_spec is not None:
+            cache_uploads = Path("cache_uploads")
+            cache_uploads.mkdir(exist_ok=True)
+            upload_path = cache_uploads / uploaded.name
+            upload_path.write_bytes(uploaded.getbuffer())
+            file_stat = upload_path.stat()
+            cache_key = build_cache_key(uploaded.name, file_stat.st_size, file_stat.st_mtime)
+            srt_path = cache_dir / f"{cache_key}.srt"
+
+            if st.button("Transcribe to SRT", key=f"transcribe_{video['video_id']}"):
+                if srt_path.exists():
+                    st.success("Menggunakan cache transkrip.")
+                else:
+                    with st.spinner("Transcribing..."):
+                        from faster_whisper import WhisperModel  # type: ignore
+
+                        model = WhisperModel("base", device="cpu", compute_type="int8")
+                        segments, _ = model.transcribe(str(upload_path))
+                        srt_lines = []
+                        for idx, segment in enumerate(segments, start=1):
+                            start = _format_srt_time(segment.start)
+                            end = _format_srt_time(segment.end)
+                            srt_lines.append(
+                                f"{idx}\n{start} --> {end}\n{segment.text.strip()}\n"
+                            )
+                        srt_path.write_text("\n".join(srt_lines), encoding="utf-8")
+                        st.success("Transkrip selesai dibuat.")
+                st.session_state[srt_text_key] = srt_path.read_text(encoding="utf-8")
+
+        srt_text = st.session_state.get(srt_text_key, "")
+        if srt_text:
+            st.text_area(
+                "Transkrip (SRT)",
+                value=srt_text,
+                height=200,
+                key=f"srt_area_{video['video_id']}",
+            )
+            if st.button("Copy Transkrip", key=f"copy_{video['video_id']}"):
+                st.toast("Transkrip siap dicopy.")
+            st.download_button(
+                "Download (.srt)",
+                data=srt_text.encode("utf-8"),
+                file_name=f"{video['video_id']}.srt",
+                mime="text/plain",
+            )
+        else:
+            st.info("Belum ada transkrip. Coba mode OAuth atau upload file lokal.")
+
+
 def sidebar_config() -> dict:
     st.sidebar.title("Configuration")
     api_key_env = os.getenv("YT_API_KEY", "")
@@ -227,6 +616,7 @@ with search_tab:
                     "video_id": detail.video_id,
                     "title": detail.title,
                     "channel": detail.channel,
+                    "channel_id": detail.channel_id,
                     "publishedAt": detail.published_at,
                     "duration_sec": detail.duration_sec,
                     "views": detail.views,
@@ -234,35 +624,13 @@ with search_tab:
                     "comments": detail.comments,
                     "VPH_1h": round(vph_1h, 2),
                     "tags": ", ".join(detail.tags),
+                    "description": detail.description,
                     "watch_url": format_video_url(detail.video_id),
                 }
             )
         if rows:
             results_df = pd.DataFrame(rows)
-            results_df = results_df[
-                [
-                    "thumbnail",
-                    "title",
-                    "channel",
-                    "publishedAt",
-                    "duration_sec",
-                    "views",
-                    "VPH_1h",
-                    "watch_url",
-                    "video_id",
-                    "likes",
-                    "comments",
-                    "tags",
-                ]
-            ]
-            st.dataframe(
-                results_df,
-                use_container_width=True,
-                column_config={
-                    "thumbnail": st.column_config.ImageColumn("thumbnail"),
-                    "watch_url": st.column_config.LinkColumn("Watch"),
-                },
-            )
+            st.session_state["search_results"] = rows
             st.session_state["last_search_results"] = [
                 {
                     "title": row["title"],
@@ -272,25 +640,100 @@ with search_tab:
                 }
                 for row in rows
             ]
+            if "selected_video_id" not in st.session_state:
+                st.session_state["selected_video_id"] = rows[0]["video_id"]
+            if st.session_state["selected_video_id"] not in results_df["video_id"].tolist():
+                st.session_state["selected_video_id"] = rows[0]["video_id"]
 
-            selected_ids = st.multiselect(
-                "Select videos", options=results_df["video_id"].tolist()
-            )
-            preview_id = st.selectbox(
-                "Preview video", options=results_df["video_id"].tolist()
-            )
-            if preview_id:
-                selected_row = results_df.loc[results_df["video_id"] == preview_id].iloc[0]
-                st.video(selected_row["watch_url"])
-                metrics_cols = st.columns(5)
-                metrics_cols[0].metric("Views", int(selected_row["views"]))
-                metrics_cols[1].metric("Likes", int(selected_row["likes"]))
-                metrics_cols[2].metric("Comments", int(selected_row["comments"]))
-                metrics_cols[3].metric("Duration (s)", int(selected_row["duration_sec"]))
-                metrics_cols[4].metric("Published", selected_row["publishedAt"])
+            st.markdown("### Preview Panel")
+            preview_id = st.session_state.get("selected_video_id")
+            preview_row = next((row for row in rows if row["video_id"] == preview_id), None)
+            if preview_row:
+                st.video(preview_row["watch_url"])
+                metrics_cols = st.columns(6)
+                metrics_cols[0].metric("Views", format_count(int(preview_row["views"])))
+                metrics_cols[1].metric("VPH/hr", f"{preview_row['VPH_1h']:.2f}")
+                metrics_cols[2].metric("Duration", format_duration(int(preview_row["duration_sec"])))
+                metrics_cols[3].metric("Published", format_age(preview_row["publishedAt"]))
+                metrics_cols[4].metric("Likes", format_count(int(preview_row["likes"])))
+                metrics_cols[5].metric("Comments", format_count(int(preview_row["comments"])))
+            else:
+                st.info("Pick a video card to preview.")
+
+            st.markdown("### Search Results")
+            selected_ids: list[str] = []
+            cards_per_row = 4
+            for start in range(0, len(rows), cards_per_row):
+                cols = st.columns(cards_per_row)
+                for col, row in zip(cols, rows[start : start + cards_per_row]):
+                    with col:
+                        with st.container(border=True):
+                            st.image(row["thumbnail"], use_container_width=True)
+                            if st.button(
+                                f"🎬 {row['title']}",
+                                key=f"title_{row['video_id']}",
+                            ):
+                                st.session_state["selected_video_id"] = row["video_id"]
+                            st.caption(row["channel"])
+                            metric_row_a = st.columns(3)
+                            metric_row_a[0].metric("Views", format_count(int(row["views"])))
+                            metric_row_a[1].metric("VPH/hr", f"{row['VPH_1h']:.2f}")
+                            metric_row_a[2].metric(
+                                "Duration", format_duration(int(row["duration_sec"]))
+                            )
+                            metric_row_b = st.columns(3)
+                            metric_row_b[0].metric(
+                                "Published", format_age(row["publishedAt"])
+                            )
+                            metric_row_b[1].metric("Likes", format_count(int(row["likes"])))
+                            metric_row_b[2].metric("Comments", format_count(int(row["comments"])))
+                            if st.checkbox("Select", key=f"select_{row['video_id']}"):
+                                selected_ids.append(row["video_id"])
+
+                            action_cols = st.columns(3)
+                            with action_cols[0]:
+                                if st.button(
+                                    "📊 Analisis",
+                                    key=f"analyze_{row['video_id']}",
+                                ):
+                                    show_video_dialog(row, config, conn)
+                            with action_cols[1]:
+                                if st.button(
+                                    "📝 Transkrip",
+                                    key=f"transcript_{row['video_id']}",
+                                ):
+                                    show_video_dialog(row, config, conn, default_tab="Transkrip")
+                            with action_cols[2]:
+                                if st.button(
+                                    "💾 Simpan",
+                                    key=f"save_{row['video_id']}",
+                                ):
+                                    now_ts = datetime.now(timezone.utc).isoformat()
+                                    db.upsert_saved_video(
+                                        conn,
+                                        video_id=row["video_id"],
+                                        title=row["title"],
+                                        channel=row["channel"],
+                                        published_at=row["publishedAt"],
+                                        duration_sec=int(row["duration_sec"]),
+                                        views=int(row["views"]),
+                                        likes=int(row["likes"]),
+                                        comments=int(row["comments"]),
+                                        tags=row["tags"],
+                                        thumbnail_url=row["thumbnail"],
+                                        watch_url=row["watch_url"],
+                                        region=region_code,
+                                        keyword=query,
+                                        category=category_input,
+                                        saved_ts=now_ts,
+                                        notes="",
+                                    )
+                                    st.toast("Saved to bank.")
+
+            st.markdown("---")
             col_a, col_b = st.columns(2)
             with col_a:
-                if st.button("Save to Bank"):
+                if st.button("Save to Bank (Selected)"):
                     now_ts = datetime.now(timezone.utc).isoformat()
                     for _, row in results_df.iterrows():
                         if row["video_id"] in selected_ids:
@@ -306,6 +749,7 @@ with search_tab:
                                 comments=int(row["comments"]),
                                 tags=row["tags"],
                                 thumbnail_url=row["thumbnail"],
+                                watch_url=row["watch_url"],
                                 region=region_code,
                                 keyword=query,
                                 category=category_input,
@@ -314,7 +758,7 @@ with search_tab:
                             )
                     st.success("Saved to bank.")
             with col_b:
-                if st.button("Add to Tracking"):
+                if st.button("Add to Tracking (Selected)"):
                     now_ts = datetime.now(timezone.utc).isoformat()
                     for _, row in results_df.iterrows():
                         if row["video_id"] in selected_ids:
@@ -325,6 +769,8 @@ with search_tab:
                                 channel=row["channel"],
                                 added_ts=now_ts,
                                 category=category_input,
+                                thumbnail_url=row["thumbnail"],
+                                watch_url=row["watch_url"],
                             )
                     st.success("Added to tracking.")
         else:
@@ -677,13 +1123,15 @@ with bank_tab:
     )
     if filtered_rows:
         bank_df = pd.DataFrame(db.iter_rows(filtered_rows))
-        bank_df["video_url"] = bank_df["video_id"].apply(format_video_url)
+        bank_df["watch_url"] = bank_df["watch_url"].fillna(
+            bank_df["video_id"].apply(format_video_url)
+        )
         st.dataframe(
             bank_df,
             use_container_width=True,
             column_config={
                 "thumbnail_url": st.column_config.ImageColumn("thumbnail"),
-                "video_url": st.column_config.LinkColumn("video_url"),
+                "watch_url": st.column_config.LinkColumn("watch_url"),
             },
         )
         edit_id = st.selectbox("Edit notes for video", bank_df["video_id"].tolist())
@@ -753,7 +1201,6 @@ with captions_tab:
     cache_dir.mkdir(exist_ok=True)
     oauth_dir = Path("oauth")
     client_secret_path = oauth_dir / "client_secret.json"
-    token_path = oauth_dir / "token.json"
 
     st.markdown("### Mode A: YouTube Captions API (OAuth)")
     api_col1, api_col2 = st.columns([2, 1])
@@ -768,32 +1215,13 @@ with captions_tab:
             "OAuth not configured. Add ./oauth/client_secret.json to enable captions API mode."
         )
 
-    def get_oauth_credentials() -> Credentials | None:
-        if not client_secret_path.exists():
-            return None
-        creds = None
-        if token_path.exists():
-            creds = Credentials.from_authorized_user_file(
-                str(token_path),
-                scopes=["https://www.googleapis.com/auth/youtube.force-ssl"],
-            )
-        if not creds or not creds.valid:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                str(client_secret_path),
-                scopes=["https://www.googleapis.com/auth/youtube.force-ssl"],
-            )
-            creds = flow.run_local_server(port=0)
-            oauth_dir.mkdir(exist_ok=True)
-            token_path.write_text(creds.to_json())
-        return creds
-
     if st.button(
         "List Caption Tracks",
         disabled=not (oauth_ready and api_video_id),
     ):
         with st.spinner("Listing caption tracks..."):
             try:
-                creds = get_oauth_credentials()
+                creds = get_oauth_credentials(oauth_dir)
                 if not creds:
                     st.error("OAuth credentials not available.")
                 else:
@@ -823,7 +1251,8 @@ with captions_tab:
             except HttpError as exc:
                 if exc.resp.status == 403:
                     st.error(
-                        "Not properly authorized / insufficient permissions for captions."
+                        "Not properly authorized / insufficient permissions for captions. "
+                        "Use local transcription mode below."
                     )
                 else:
                     st.error(f"YouTube API error: {exc}")
@@ -839,7 +1268,7 @@ with captions_tab:
         ):
             with st.spinner("Downloading captions..."):
                 try:
-                    creds = get_oauth_credentials()
+                    creds = get_oauth_credentials(oauth_dir)
                     if not creds:
                         st.error("OAuth credentials not available.")
                     else:
@@ -861,7 +1290,8 @@ with captions_tab:
                 except HttpError as exc:
                     if exc.resp.status == 403:
                         st.error(
-                            "Not properly authorized / insufficient permissions for captions."
+                            "Not properly authorized / insufficient permissions for captions. "
+                            "Use local transcription mode below."
                         )
                     else:
                         st.error(f"YouTube API error: {exc}")
@@ -871,23 +1301,19 @@ with captions_tab:
     uploaded = st.file_uploader(
         "Upload audio/video (mp3/wav/mp4)", type=["mp3", "wav", "mp4"]
     )
-    try:
-        from faster_whisper import WhisperModel  # type: ignore
-    except ImportError:
-        WhisperModel = None
-
-    if WhisperModel is None:
+    whisper_spec = importlib.util.find_spec("faster_whisper")
+    if whisper_spec is None:
         st.info(
             "Local transcription requires extra dependencies. Install with:\n"
             "`pip install -r requirements-extra.txt`"
         )
-    if uploaded and WhisperModel is not None:
+    if uploaded and whisper_spec is not None:
         cache_uploads = Path("cache_uploads")
         cache_uploads.mkdir(exist_ok=True)
         upload_path = cache_uploads / uploaded.name
         upload_path.write_bytes(uploaded.getbuffer())
         file_stat = upload_path.stat()
-        cache_key = f"{uploaded.name}_{file_stat.st_size}_{file_stat.st_mtime}"
+        cache_key = build_cache_key(uploaded.name, file_stat.st_size, file_stat.st_mtime)
         srt_path = cache_dir / f"{cache_key}.srt"
 
         if st.button("Transcribe to SRT"):
@@ -895,6 +1321,8 @@ with captions_tab:
                 st.success(f"Using cached transcript: {srt_path}")
             else:
                 with st.spinner("Transcribing..."):
+                    from faster_whisper import WhisperModel  # type: ignore
+
                     model = WhisperModel("base", device="cpu", compute_type="int8")
                     segments, _ = model.transcribe(str(upload_path))
                     srt_lines = []
