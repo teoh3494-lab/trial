@@ -87,6 +87,14 @@ def format_video_url(video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}"
 
 
+def format_duration(seconds: int) -> str:
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
 def compute_vph(snapshots: pd.DataFrame, hours: int) -> float:
     if len(snapshots) < 2:
         return 0.0
@@ -172,26 +180,55 @@ search_tab, vph_tab, heatmap_tab, market_tab, idea_tab, bank_tab, tracked_tab, c
 
 with search_tab:
     st.subheader("Super Search Engine")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        query = st.text_input("Keyword (q)")
-        region_code = st.text_input("regionCode", value="ID")
-        relevance_language = st.text_input("relevanceLanguage", value="id")
-    with col2:
-        published_days = st.number_input("Published within last X days", min_value=1, max_value=365, value=7)
-        order = st.selectbox("Order", ["date", "relevance", "viewCount", "rating"])
-        video_duration = st.selectbox("videoDuration", ["any", "short", "medium", "long"])
-    with col3:
-        max_results = st.slider("Max results", min_value=5, max_value=50, value=20)
-        shorts_only = st.checkbox("Shorts asli (<= 60s)")
-        category_input = st.text_input("Category / Niche", value="General")
-
     if "search_running" not in st.session_state:
         st.session_state["search_running"] = False
-    search_button = st.button(
-        "Search",
-        disabled=not (config["yt_key"] and query) or st.session_state["search_running"],
+    if "search_df" not in st.session_state:
+        st.session_state["search_df"] = None
+    if "selected_video_id" not in st.session_state:
+        st.session_state["selected_video_id"] = None
+    if "show_analysis" not in st.session_state:
+        st.session_state["show_analysis"] = False
+    if "show_transcript" not in st.session_state:
+        st.session_state["show_transcript"] = False
+    if "search_meta" not in st.session_state:
+        st.session_state["search_meta"] = {}
+
+    with st.form("search_form"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            query = st.text_input("Keyword (q)")
+            region_code = st.text_input("regionCode", value="ID")
+            relevance_language = st.text_input("relevanceLanguage", value="id")
+        with col2:
+            published_days = st.number_input(
+                "Published within last X days", min_value=1, max_value=365, value=7
+            )
+            order = st.selectbox("Order", ["date", "relevance", "viewCount", "rating"])
+            video_duration = st.selectbox(
+                "videoDuration", ["any", "short", "medium", "long"]
+            )
+        with col3:
+            max_results = st.slider("Max results", min_value=5, max_value=50, value=20)
+            shorts_only = st.checkbox("Shorts asli (<= 60s)")
+            category_input = st.text_input("Category / Niche", value="General")
+
+        search_button = st.form_submit_button(
+            "Search",
+            disabled=not (config["yt_key"] and query)
+            or st.session_state["search_running"],
+        )
+
+    clear_results = st.button(
+        "Clear results", disabled=st.session_state["search_df"] is None
     )
+    if clear_results:
+        st.session_state["search_df"] = None
+        st.session_state["selected_video_id"] = None
+        st.session_state["show_analysis"] = False
+        st.session_state["show_transcript"] = False
+        for key in list(st.session_state.keys()):
+            if key.startswith(("sel_", "ana_", "tr_", "sv_")):
+                st.session_state.pop(key, None)
 
     if search_button:
         st.session_state["search_running"] = True
@@ -237,8 +274,8 @@ with search_tab:
                     "watch_url": format_video_url(detail.video_id),
                 }
             )
-        if rows:
-            results_df = pd.DataFrame(rows)
+        results_df = pd.DataFrame(rows)
+        if not results_df.empty:
             results_df = results_df[
                 [
                     "thumbnail",
@@ -255,80 +292,188 @@ with search_tab:
                     "tags",
                 ]
             ]
-            st.dataframe(
-                results_df,
-                use_container_width=True,
-                column_config={
-                    "thumbnail": st.column_config.ImageColumn("thumbnail"),
-                    "watch_url": st.column_config.LinkColumn("Watch"),
-                },
-            )
-            st.session_state["last_search_results"] = [
-                {
-                    "title": row["title"],
-                    "channel": row["channel"],
-                    "views": row["views"],
-                    "duration": row["duration_sec"],
-                }
-                for row in rows
-            ]
+        st.session_state["search_df"] = results_df
+        st.session_state["search_meta"] = {
+            "query": query,
+            "region_code": region_code,
+            "category": category_input,
+            "shorts_only": shorts_only,
+        }
+        st.session_state["last_search_results"] = [
+            {
+                "title": row["title"],
+                "channel": row["channel"],
+                "views": row["views"],
+                "duration": row["duration_sec"],
+            }
+            for row in rows
+        ]
 
-            selected_ids = st.multiselect(
-                "Select videos", options=results_df["video_id"].tolist()
+    results_df = st.session_state.get("search_df")
+
+    def open_video_dialog(video_row: pd.Series, show_transcript: bool) -> None:
+        @st.dialog("Analitik Video")
+        def _dialog() -> None:
+            header_cols = st.columns([1, 2])
+            with header_cols[0]:
+                st.image(video_row["thumbnail"], use_column_width=True)
+            with header_cols[1]:
+                st.markdown(f"### {video_row['title']}")
+                st.caption(video_row["channel"])
+                st.write(
+                    f"Views: {int(video_row['views']):,} · "
+                    f"VPH/hr: {video_row['VPH_1h']:.2f} · "
+                    f"Duration: {format_duration(int(video_row['duration_sec']))}"
+                )
+                st.link_button("Lihat di YouTube", video_row["watch_url"])
+
+            tabs = st.tabs(["Performance", "Transkrip"])
+            with tabs[0]:
+                st.write(
+                    f"Likes: {int(video_row['likes']):,} · "
+                    f"Comments: {int(video_row['comments']):,}"
+                )
+                st.write(f"Published: {video_row['publishedAt']}")
+                if video_row["tags"]:
+                    st.write(f"Tags: {video_row['tags']}")
+            with tabs[1]:
+                transcript_store = st.session_state.get("transcripts", {})
+                transcript_text = transcript_store.get(
+                    video_row["video_id"], "Transkrip belum tersedia."
+                )
+                st.text_area(
+                    "Copy Transkrip",
+                    value=transcript_text,
+                    height=260,
+                )
+                st.download_button(
+                    "Download SRT",
+                    data=transcript_text.encode("utf-8"),
+                    file_name=f"{video_row['video_id']}.srt",
+                    mime="text/plain",
+                    disabled=transcript_text == "Transkrip belum tersedia.",
+                )
+
+                if show_transcript:
+                    st.caption("Tab Transkrip dipilih dari tombol Transkrip.")
+
+        _dialog()
+
+    if results_df is None:
+        st.info("Belum ada hasil pencarian.")
+    elif results_df.empty:
+        st.info("No results to display.")
+    else:
+        meta = st.session_state.get("search_meta", {})
+        st.markdown(f"**Hasil Pencarian untuk:** {meta.get('query', '')}")
+
+        selected_ids = [
+            vid
+            for vid in results_df["video_id"].tolist()
+            if st.session_state.get(f"sel_{vid}")
+        ]
+        bulk_cols = st.columns(2)
+        with bulk_cols[0]:
+            if st.button("Save selected to Bank", disabled=not selected_ids):
+                now_ts = datetime.now(timezone.utc).isoformat()
+                for _, row in results_df.iterrows():
+                    if row["video_id"] in selected_ids:
+                        db.upsert_saved_video(
+                            conn,
+                            video_id=row["video_id"],
+                            title=row["title"],
+                            channel=row["channel"],
+                            published_at=row["publishedAt"],
+                            duration_sec=int(row["duration_sec"]),
+                            views=int(row["views"]),
+                            likes=int(row["likes"]),
+                            comments=int(row["comments"]),
+                            tags=row["tags"],
+                            thumbnail_url=row["thumbnail"],
+                            region=meta.get("region_code", ""),
+                            keyword=meta.get("query", ""),
+                            category=meta.get("category", ""),
+                            saved_ts=now_ts,
+                            notes="",
+                        )
+                st.success("Saved to bank.")
+        with bulk_cols[1]:
+            if st.button("Add selected to Tracking", disabled=not selected_ids):
+                now_ts = datetime.now(timezone.utc).isoformat()
+                for _, row in results_df.iterrows():
+                    if row["video_id"] in selected_ids:
+                        db.add_tracked_video(
+                            conn,
+                            video_id=row["video_id"],
+                            title=row["title"],
+                            channel=row["channel"],
+                            added_ts=now_ts,
+                            category=meta.get("category", ""),
+                        )
+                st.success("Added to tracking.")
+
+        cards_per_row = 4
+        rows = results_df.to_dict("records")
+        for start in range(0, len(rows), cards_per_row):
+            columns = st.columns(cards_per_row)
+            for column, row in zip(columns, rows[start : start + cards_per_row]):
+                vid = row["video_id"]
+                with column:
+                    st.image(row["thumbnail"], use_column_width=True)
+                    st.markdown(f"**{row['title']}**")
+                    st.caption(row["channel"])
+                    st.caption(
+                        f"Views: {int(row['views']):,} · "
+                        f"VPH/hr: {row['VPH_1h']:.2f}"
+                    )
+                    st.caption(
+                        f"Duration: {format_duration(int(row['duration_sec']))}"
+                    )
+                    st.checkbox("Select", key=f"sel_{vid}")
+                    action_cols = st.columns(3)
+                    if action_cols[0].button("Analisis", key=f"ana_{vid}"):
+                        st.session_state["selected_video_id"] = vid
+                        st.session_state["show_analysis"] = True
+                        st.session_state["show_transcript"] = False
+                        st.rerun()
+                    if action_cols[1].button("Transkrip", key=f"tr_{vid}"):
+                        st.session_state["selected_video_id"] = vid
+                        st.session_state["show_analysis"] = True
+                        st.session_state["show_transcript"] = True
+                        st.rerun()
+                    if action_cols[2].button("Simpan", key=f"sv_{vid}"):
+                        now_ts = datetime.now(timezone.utc).isoformat()
+                        db.upsert_saved_video(
+                            conn,
+                            video_id=row["video_id"],
+                            title=row["title"],
+                            channel=row["channel"],
+                            published_at=row["publishedAt"],
+                            duration_sec=int(row["duration_sec"]),
+                            views=int(row["views"]),
+                            likes=int(row["likes"]),
+                            comments=int(row["comments"]),
+                            tags=row["tags"],
+                            thumbnail_url=row["thumbnail"],
+                            region=meta.get("region_code", ""),
+                            keyword=meta.get("query", ""),
+                            category=meta.get("category", ""),
+                            saved_ts=now_ts,
+                            notes="",
+                        )
+                        st.success("Saved to bank.")
+
+        if st.session_state.get("show_analysis") and st.session_state.get(
+            "selected_video_id"
+        ):
+            selected_row = results_df.loc[
+                results_df["video_id"] == st.session_state["selected_video_id"]
+            ].iloc[0]
+            open_video_dialog(
+                selected_row, st.session_state.get("show_transcript", False)
             )
-            preview_id = st.selectbox(
-                "Preview video", options=results_df["video_id"].tolist()
-            )
-            if preview_id:
-                selected_row = results_df.loc[results_df["video_id"] == preview_id].iloc[0]
-                st.video(selected_row["watch_url"])
-                metrics_cols = st.columns(5)
-                metrics_cols[0].metric("Views", int(selected_row["views"]))
-                metrics_cols[1].metric("Likes", int(selected_row["likes"]))
-                metrics_cols[2].metric("Comments", int(selected_row["comments"]))
-                metrics_cols[3].metric("Duration (s)", int(selected_row["duration_sec"]))
-                metrics_cols[4].metric("Published", selected_row["publishedAt"])
-            col_a, col_b = st.columns(2)
-            with col_a:
-                if st.button("Save to Bank"):
-                    now_ts = datetime.now(timezone.utc).isoformat()
-                    for _, row in results_df.iterrows():
-                        if row["video_id"] in selected_ids:
-                            db.upsert_saved_video(
-                                conn,
-                                video_id=row["video_id"],
-                                title=row["title"],
-                                channel=row["channel"],
-                                published_at=row["publishedAt"],
-                                duration_sec=int(row["duration_sec"]),
-                                views=int(row["views"]),
-                                likes=int(row["likes"]),
-                                comments=int(row["comments"]),
-                                tags=row["tags"],
-                                thumbnail_url=row["thumbnail"],
-                                region=region_code,
-                                keyword=query,
-                                category=category_input,
-                                saved_ts=now_ts,
-                                notes="",
-                            )
-                    st.success("Saved to bank.")
-            with col_b:
-                if st.button("Add to Tracking"):
-                    now_ts = datetime.now(timezone.utc).isoformat()
-                    for _, row in results_df.iterrows():
-                        if row["video_id"] in selected_ids:
-                            db.add_tracked_video(
-                                conn,
-                                video_id=row["video_id"],
-                                title=row["title"],
-                                channel=row["channel"],
-                                added_ts=now_ts,
-                                category=category_input,
-                            )
-                    st.success("Added to tracking.")
-        else:
-            st.info("No results to display.")
+            st.session_state["show_analysis"] = False
+            st.session_state["show_transcript"] = False
 
 
 with vph_tab:
